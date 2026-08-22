@@ -1,0 +1,178 @@
+from scripts.split_fasta_regions import split_fasta
+from snakemake.utils import R
+from collections.abc import Iterable
+
+import getpass
+import os
+import glob
+import re
+
+localrules: all
+
+REFERENCE = "/home/lyh/lyc/project_vcf_M4_extract_mito/reference/NC_004454.2.fna"
+RAW_READS_DIR = "/data/lyc_vcf_new/input"
+OUTPUT_DIR = "/data/lyc_vcf_next/output_mito_1120"
+SCRATCH = "/data/lyc_vcf_next/temp/mito"
+
+CONSENSUS_DIR = f"{OUTPUT_DIR}/consensus_seq"
+PLOIDY_CONSENSUS = 1
+
+VDESRef = REFERENCE
+SPLITS = range(300)
+REGIONS = split_fasta(VDESRef, len(SPLITS))
+
+for region in REGIONS:
+    for idx, i in enumerate(REGIONS[region]):
+        REGIONS[region][idx] = " -r " + str(i)
+
+SAMPLES = []
+for fq1 in glob.glob(f"{RAW_READS_DIR}/*_1.fastq.gz"):
+    base_name = os.path.basename(fq1).rsplit("_", 1)[0]
+    fq2 = fq1.replace("_1.fastq.gz", "_2.fastq.gz")
+    if os.path.exists(fq2):
+        SAMPLES.append(base_name)
+    else:
+        print(f"Warning：Sample {base_name} lack _2 file, skipped")
+SAMPLES = sorted(list(set(SAMPLES)))
+print(f"Sample List：{SAMPLES}")
+
+
+rule all:
+    input:
+        expand(f"/data/lyc_vcf_next/output_mito/alignments/ngm/{{sample}}.bam", sample=SAMPLES),
+        expand(f"/data/lyc_vcf_next/output_mito/alignments/ngm/{{sample}}.bam.bai", sample=SAMPLES),
+        expand(f"{OUTPUT_DIR}/var/ngm/freebayes_filtered.vcf")
+        #expand(f"{OUTPUT_DIR}/meta/{{sample}}.txt",sample=SAMPLES)
+        #expand(f"{CONSENSUS_DIR}/{{sample}}_consensus.fa", sample=SAMPLES)
+
+rule align_and_dedup:
+    input:
+        read1="/data/lyc_vcf_new/input/{sample}_1.fastq.gz",
+        read2="/data/lyc_vcf_new/input/{sample}_2.fastq.gz",
+        ref=REFERENCE
+    output:
+        bam=temp("/data/lyc_vcf_next/output_mito/alignments/ngm/{sample}.dedup.bam"),
+        bai=temp("/data/lyc_vcf_next/output_mito/alignments/ngm/{sample}.dedup.bam.bai")
+    shell:
+        """    
+        mkdir -p {SCRATCH}/ngm/
+        echo "___ngm___" 
+        ngm -t 8 --qry1 {input.read1} --qry2 {input.read2} --paired -r {input.ref} --local --very-sensitive --rg-id {wildcards.sample} --rg-sm {wildcards.sample} --rg-pl ILLUMINA --rg-lb NEXTERA --rg-cn ZJU | 
+        samtools view -Su - | 
+        samtools fixmate -u -m - - |\
+        samtools sort - -m 40G -T {SCRATCH}/ngm/{wildcards.sample} -o {SCRATCH}/ngm/{wildcards.sample}.sorted.bam
+        
+        samtools markdup -r {SCRATCH}/ngm/{wildcards.sample}.sorted.bam {output.bam}
+        samtools index {output.bam}
+        samtools quickcheck {output.bam} || (echo "BAM文件验证失败"; exit 1)
+        """
+
+rule run_variant:
+    input:
+        bam=rules.align_and_dedup.output.bam,
+        bai=rules.align_and_dedup.output.bai
+    output:
+        bam="/data/lyc_vcf_next/output_mito/alignments/ngm/{sample}.bam",
+        bai="/data/lyc_vcf_next/output_mito/alignments/ngm/{sample}.bam.bai",
+        log="/data/lyc_vcf_next/output_mito/alignments/ngm/{sample}.variant.log"
+    shell:
+        """
+        mkdir -p {OUTPUT_DIR}/alignments/ngm/
+        
+        variant {input.bam} -m 50 --bam -o {output.bam} 2> {output.log}
+        
+        samtools index {output.bam}
+        """
+
+rule statsbam:
+    input:
+        alignment = f"/data/lyc_vcf_next/output_mito/alignments/ngm/{{sample}}.bam"
+    output:
+        f"/data/lyc_vcf_next/output_mito/meta/{{sample}}.txt"
+    threads: 16
+
+    shell:
+        """
+        mkdir -p {OUTPUT_DIR}/meta
+		echo {wildcards.sample} > {output}
+		samtools depth -a {input.alignment} | awk '{{sum+=$3}} END {{ print "Mean Average Coverage on all sites = ",sum/NR}}' >> {output}
+		samtools depth -a -r NC_004454.2 {input.alignment} | awk '{{sum+=$3}} END {{ print "Mean Average Coverage on mitochondrion = ",sum/NR}}' >> {output}
+		samtools flagstat {input.alignment} >> {output}
+		"""
+
+rule freebayes:
+    input:
+        expand(f"/data/lyc_vcf_next/output_mito/alignments/ngm/{{sample}}.bam", sample=SAMPLES)
+    output:
+        temp(f"{OUTPUT_DIR}/var/ngm/snponly_split/freebayes.{{region}}.vcf")
+    params:
+        span = lambda wildcards: REGIONS[wildcards.region],
+        bams = lambda wildcards, input: " ".join(input),
+        filtering = "--min-alternate-count 3 --min-alternate-fraction 0.2 --min-mapping-quality 8 --min-base-quality 5 --use-best-n-alleles 4"
+    shell:
+        """
+        freebayes {params.filtering} --fasta-reference {VDESRef} {params.span} {params.bams} > {output}
+        """
+
+rule merge_vcf:
+    input:
+        expand(f"{OUTPUT_DIR}/var/ngm/snponly_split/freebayes.{{region}}.vcf", region=REGIONS.keys())
+    output:
+        f"{OUTPUT_DIR}/var/ngm/snponly_freebayes.vcf"
+    shell:
+        """
+        mkdir -p {OUTPUT_DIR}/var/ngm
+        bcftools concat -Oz -o {output}.tmp {input}
+        bcftools view -Ov {output}.tmp > {output}
+        rm {output}.tmp
+        """
+
+rule filter_vcf:
+    input:
+        vcf = f"{OUTPUT_DIR}/var/ngm/snponly_freebayes.vcf"  
+    output:
+        vcf_filtered = f"{OUTPUT_DIR}/var/ngm/freebayes_filtered.vcf" 
+    params:
+        span = "--chr NC_004454.2",
+        filters = "--max-alleles 2 --minQ 40 --minDP 5 --maxDP 50 --max-missing 0.5 --maf 0.05"
+    shell:
+        """
+        echo "start generating VCF file..."
+        OUTPUT_FILE="{output.vcf_filtered}"
+        OUTPUT_PREFIX="${{OUTPUT_FILE%.vcf}}"
+        vcftools --vcf '{input.vcf}' {params.span} {params.filters} --recode --recode-INFO-all --out $OUTPUT_PREFIX 2> $OUTPUT_PREFIX.log
+        echo "finish generating VCF file..."
+        mv $OUTPUT_PREFIX.recode.vcf {output.vcf_filtered}
+        """
+
+rule sample_variants:
+    input:
+        bam = f"/data/lyc_vcf_next/output_mito/alignments/ngm/{{sample}}.bam",
+        bai = f"/data/lyc_vcf_next/output_mito/alignments/ngm/{{sample}}.bam.bai",
+        ref = REFERENCE
+    output:
+        vcf = temp(f"{SCRATCH}/variants/{{sample}}.vcf.gz")
+    params:
+        ploidy = PLOIDY_CONSENSUS
+    shell:
+        """
+        mkdir -p {SCRATCH}/variants
+        bcftools mpileup -Ou -f {input.ref} {input.bam} | \
+        bcftools call -mv --ploidy {params.ploidy} -Oz -o {output.vcf}
+        bcftools index {output.vcf}
+        """
+
+rule generate_consensus:
+    input:
+        vcf = f"{SCRATCH}/variants/{{sample}}.vcf.gz",
+        ref = REFERENCE
+    output:
+        consensus = f"{CONSENSUS_DIR}/{{sample}}_consensus.fa"
+    params:
+        iupac = "--iupac-codes" if PLOIDY_CONSENSUS == 2 else ""
+    shell:
+        """
+        mkdir -p {CONSENSUS_DIR}
+        bcftools consensus {params.iupac} -f {input.ref} {input.vcf} | \
+        sed '1s/^>.*/>%s/' > {output.consensus}
+        """
