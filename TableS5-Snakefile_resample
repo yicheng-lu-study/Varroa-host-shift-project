@@ -1,0 +1,701 @@
+from pathlib import Path
+import glob
+import hashlib
+import math
+import os
+import subprocess
+
+
+localrules: all, write_feasibility_report, panelA, panelB, panelC
+
+
+VCF_PATH = config.get("vcf_path", "vcf/snps_0095.recode.vcf")
+OUTPUT_DIR = config.get("output_dir", "output")
+SAMPLING_MODE = config.get("sampling_mode", "random")
+if SAMPLING_MODE not in {"random", "balanced"}:
+    raise ValueError("sampling_mode must be either 'random' or 'balanced'")
+
+PANELS = {
+    "panelA": {
+        "pop_dir": "input-group/panelA",
+        "sample_n": 4,   
+        "seed": 1101,
+    },
+    "panelB": {
+        "pop_dir": "input-group/panelB",
+        "sample_n": 5,   
+        "seed": 2202,
+    },
+    "panelC": {
+        "pop_dir": "input-group/panelC",
+        "sample_n": 7,   
+        "seed": 3303,
+    },
+}
+
+REPLICATE_TARGETS = [100, 200]
+WINDOW_SIZE = 100000
+WINDOW_STEP = 10000
+UNIQUE_ONLY = True
+
+
+def is_placeholder(path: str) -> bool:
+    return path.startswith("__") and path.endswith("__")
+
+
+def sample_count(pop_file: str) -> int:
+    with open(pop_file) as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def stable_seed(panel: str, group: str, replicates: int) -> int:
+    payload = f"{panel}|{group}|{replicates}".encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    return int(digest[:8], 16)
+
+
+def feasible_replicates(n_samples: int, sample_n: int):
+    if sample_n > n_samples:
+        return []
+    total = math.comb(n_samples, sample_n)
+    return [rep for rep in REPLICATE_TARGETS if total >= rep]
+
+
+def group_summary_path(panel: str, group: str, rep: int) -> str:
+    n = PANELS[panel]["sample_n"]
+    return f"{OUTPUT_DIR}/{panel}/n{n}/rep{rep}/{group}/summary.tsv"
+
+
+def group_metrics_path(panel: str, group: str, rep: int) -> str:
+    n = PANELS[panel]["sample_n"]
+    return f"{OUTPUT_DIR}/{panel}/n{n}/rep{rep}/{group}/replicate_metrics.tsv"
+
+
+def pop_manifest_path(panel: str, group: str, rep: int) -> str:
+    n = PANELS[panel]["sample_n"]
+    return f"{OUTPUT_DIR}/{panel}/n{n}/rep{rep}/{group}/replicate_pop_manifest.tsv"
+
+
+def all_samples_summary_path(panel: str, group: str) -> str:
+    return f"{OUTPUT_DIR}/{panel}/all_samples/{group}/summary.tsv"
+
+
+def all_samples_metrics_path(panel: str, group: str) -> str:
+    return f"{OUTPUT_DIR}/{panel}/all_samples/{group}/replicate_metrics.tsv"
+
+
+def all_samples_manifest_path(panel: str, group: str) -> str:
+    return f"{OUTPUT_DIR}/{panel}/all_samples/{group}/replicate_pop_manifest.tsv"
+
+
+PANEL_GROUPS = {}
+FEASIBILITY_ROWS = []
+
+for panel, panel_cfg in PANELS.items():
+    pop_dir = panel_cfg["pop_dir"]
+    groups = []
+    if not is_placeholder(pop_dir) and os.path.isdir(pop_dir):
+        for pop_file in sorted(glob.glob(os.path.join(pop_dir, "*.pop"))):
+            group = Path(pop_file).stem
+            n_samples = sample_count(pop_file)
+            reps = feasible_replicates(n_samples, panel_cfg["sample_n"])
+            groups.append(
+                {
+                    "group": group,
+                    "pop_file": pop_file,
+                    "n_samples": n_samples,
+                    "replicates": reps,
+                }
+            )
+            FEASIBILITY_ROWS.append(
+                {
+                    "panel": panel,
+                    "group": group,
+                    "pop_file": pop_file,
+                    "n_samples": n_samples,
+                    "sample_n": panel_cfg["sample_n"],
+                    "combination_count": math.comb(n_samples, panel_cfg["sample_n"])
+                    if panel_cfg["sample_n"] <= n_samples
+                    else 0,
+                    "run_rep100": 100 in reps,
+                    "run_rep200": 200 in reps,
+                    "status": "included" if reps else "excluded",
+                }
+            )
+    PANEL_GROUPS[panel] = groups
+
+
+def panel_target_summaries(panel: str):
+    outputs = []
+    for item in PANEL_GROUPS[panel]:
+        for rep in item["replicates"]:
+            outputs.append(group_summary_path(panel, item["group"], rep))
+            outputs.append(group_metrics_path(panel, item["group"], rep))
+            outputs.append(pop_manifest_path(panel, item["group"], rep))
+    return outputs
+
+
+def panel_rollup_path(panel: str, rep: int) -> str:
+    n = PANELS[panel]["sample_n"]
+    return f"{OUTPUT_DIR}/{panel}/n{n}/rep{rep}/panel_summary.tsv"
+
+
+def panel_rollup_targets(panel: str):
+    reps = set()
+    for item in PANEL_GROUPS[panel]:
+        reps.update(item["replicates"])
+    return [panel_rollup_path(panel, rep) for rep in sorted(reps)]
+
+
+def panel_summary_inputs(panel: str, rep: int):
+    files = []
+    for item in PANEL_GROUPS[panel]:
+        if rep in item["replicates"]:
+            files.append(group_summary_path(panel, item["group"], rep))
+    return files
+
+
+def master_rollup_targets():
+    files = []
+    for panel in PANELS:
+        files.extend(panel_rollup_targets(panel))
+    return files
+
+
+def get_pop_file(panel: str, group: str) -> str:
+    for item in PANEL_GROUPS[panel]:
+        if item["group"] == group:
+            return item["pop_file"]
+    raise ValueError(f"Unknown group {group} in {panel}")
+
+
+def get_n_samples(panel: str, group: str) -> int:
+    for item in PANEL_GROUPS[panel]:
+        if item["group"] == group:
+            return item["n_samples"]
+    raise ValueError(f"Unknown group {group} in {panel}")
+
+
+def all_samples_group_targets():
+    outputs = []
+    for panel in PANELS:
+        for item in PANEL_GROUPS[panel]:
+            outputs.append(all_samples_summary_path(panel, item["group"]))
+            outputs.append(all_samples_metrics_path(panel, item["group"]))
+            outputs.append(all_samples_manifest_path(panel, item["group"]))
+    return outputs
+
+
+def panel_all_samples_summary_path(panel: str) -> str:
+    return f"{OUTPUT_DIR}/{panel}/all_samples/panel_all_samples_summary.tsv"
+
+
+def panel_all_samples_summary_inputs(panel: str):
+    return [
+        all_samples_summary_path(panel, item["group"])
+        for item in PANEL_GROUPS[panel]
+    ]
+
+
+def panel_all_samples_summary_targets():
+    return [
+        panel_all_samples_summary_path(panel)
+        for panel in PANELS
+        if PANEL_GROUPS[panel]
+    ]
+
+
+def master_all_samples_summary_path() -> str:
+    return f"{OUTPUT_DIR}/feasibility/master_all_samples_summary.tsv"
+
+
+def panel_rep_metrics_inputs(panel: str, rep: int):
+    files = []
+    for item in PANEL_GROUPS[panel]:
+        if rep in item["replicates"]:
+            files.append(group_metrics_path(panel, item["group"], rep))
+    return files
+
+
+def panel_rep_values(panel: str):
+    reps = set()
+    for item in PANEL_GROUPS[panel]:
+        reps.update(item["replicates"])
+    return sorted(reps)
+
+
+def panel_rep_scatter_path(panel: str, rep: int) -> str:
+    n = PANELS[panel]["sample_n"]
+    return (
+        f"{OUTPUT_DIR}/plots/{panel}/n{n}/rep{rep}/"
+        f"{panel}_n{n}_rep{rep}_replicate_scatter.pdf"
+    )
+
+
+def panel_summary_plot_path(panel: str) -> str:
+    return f"{OUTPUT_DIR}/plots/{panel}/{panel}_summary_by_replicate_count.pdf"
+
+
+def all_panels_summary_plot_path() -> str:
+    return f"{OUTPUT_DIR}/plots/all_panels_summary_by_replicate_count.pdf"
+
+
+def all_samples_summary_plot_path() -> str:
+    return f"{OUTPUT_DIR}/plots/all_panels_all_samples_summary.pdf"
+
+
+def combined_summary_plot_path() -> str:
+    return f"{OUTPUT_DIR}/plots/all_panels_rarefaction_and_all_samples_summary.pdf"
+
+
+def panel_rep_scatter_targets():
+    files = []
+    for panel in PANELS:
+        for rep in panel_rep_values(panel):
+            files.append(panel_rep_scatter_path(panel, rep))
+    return files
+
+
+def panel_summary_plot_targets():
+    files = []
+    for panel in PANELS:
+        if panel_rep_values(panel):
+            files.append(panel_summary_plot_path(panel))
+    return files
+
+
+def plot_targets():
+    return (
+        panel_rep_scatter_targets()
+        + panel_summary_plot_targets()
+        + [all_panels_summary_plot_path()]
+        + [all_samples_summary_plot_path()]
+        + [combined_summary_plot_path()]
+    )
+
+
+rule all:
+    input:
+        f"{OUTPUT_DIR}/feasibility/rarefaction_feasibility.tsv",
+        f"{OUTPUT_DIR}/feasibility/master_panel_summary.tsv",
+        f"{OUTPUT_DIR}/feasibility/panelA.done",
+        f"{OUTPUT_DIR}/feasibility/panelB.done",
+        f"{OUTPUT_DIR}/feasibility/panelC.done",
+        all_samples_group_targets(),
+        panel_all_samples_summary_targets(),
+        master_all_samples_summary_path(),
+        plot_targets(),
+
+
+rule write_feasibility_report:
+    output:
+        f"{OUTPUT_DIR}/feasibility/rarefaction_feasibility.tsv"
+    run:
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        with open(output[0], "w") as handle:
+            handle.write(
+                "\t".join(
+                    [
+                        "panel",
+                        "group",
+                        "pop_file",
+                        "n_samples",
+                        "sample_n",
+                        "combination_count",
+                        "run_rep100",
+                        "run_rep200",
+                        "status",
+                    ]
+                )
+                + "\n"
+            )
+            for row in FEASIBILITY_ROWS:
+                handle.write(
+                    "\t".join(
+                        [
+                            row["panel"],
+                            row["group"],
+                            row["pop_file"],
+                            str(row["n_samples"]),
+                            str(row["sample_n"]),
+                            str(row["combination_count"]),
+                            str(row["run_rep100"]),
+                            str(row["run_rep200"]),
+                            row["status"],
+                        ]
+                    )
+                    + "\n"
+                )
+
+
+rule panelA:
+    input:
+        f"{OUTPUT_DIR}/feasibility/rarefaction_feasibility.tsv",
+        panel_target_summaries("panelA"),
+        panel_rollup_targets("panelA")
+    output:
+        f"{OUTPUT_DIR}/feasibility/panelA.done"
+    shell:
+        r"""
+        mkdir -p {OUTPUT_DIR}/feasibility
+        touch {output}
+        """
+
+
+rule panelB:
+    input:
+        f"{OUTPUT_DIR}/feasibility/rarefaction_feasibility.tsv",
+        panel_target_summaries("panelB"),
+        panel_rollup_targets("panelB")
+    output:
+        f"{OUTPUT_DIR}/feasibility/panelB.done"
+    shell:
+        r"""
+        mkdir -p {OUTPUT_DIR}/feasibility
+        touch {output}
+        """
+
+
+rule panelC:
+    input:
+        f"{OUTPUT_DIR}/feasibility/rarefaction_feasibility.tsv",
+        panel_target_summaries("panelC"),
+        panel_rollup_targets("panelC")
+    output:
+        f"{OUTPUT_DIR}/feasibility/panelC.done"
+    shell:
+        r"""
+        mkdir -p {OUTPUT_DIR}/feasibility
+        touch {output}
+        """
+
+
+rule run_group_rarefaction:
+    input:
+        pop_file=lambda wildcards: get_pop_file(wildcards.panel, wildcards.group)
+    output:
+        summary=f"{OUTPUT_DIR}/{{panel}}/n{{sample_n}}/rep{{reps}}/{{group}}/summary.tsv",
+        metrics=f"{OUTPUT_DIR}/{{panel}}/n{{sample_n}}/rep{{reps}}/{{group}}/replicate_metrics.tsv",
+        manifest=f"{OUTPUT_DIR}/{{panel}}/n{{sample_n}}/rep{{reps}}/{{group}}/replicate_pop_manifest.tsv"
+    params:
+        vcf=VCF_PATH,
+        output_dir=lambda wildcards: f"{OUTPUT_DIR}/{wildcards.panel}/n{wildcards.sample_n}/rep{wildcards.reps}/{wildcards.group}",
+        sample_n=lambda wildcards: int(wildcards.sample_n),
+        base_seed=lambda wildcards: PANELS[wildcards.panel]["seed"]
+        + stable_seed(wildcards.panel, wildcards.group, int(wildcards.reps)),
+        unique_flag="--unique-only" if UNIQUE_ONLY else "",
+        sampling_mode=SAMPLING_MODE,
+        window_size=WINDOW_SIZE,
+        window_step=WINDOW_STEP
+    shell:
+        r"""
+        python3 scripts/run_rarefaction_vcftools.py \
+            --vcf "{params.vcf}" \
+            --source-pop "{input.pop_file}" \
+            --panel "{wildcards.panel}" \
+            --group "{wildcards.group}" \
+            --sample-n "{params.sample_n}" \
+            --replicates "{wildcards.reps}" \
+            --seed "{params.base_seed}" \
+            --window-size "{params.window_size}" \
+            --window-step "{params.window_step}" \
+            --output-dir "{params.output_dir}" \
+            --summary-out "{output.summary}" \
+            --metrics-out "{output.metrics}" \
+            --manifest-out "{output.manifest}" \
+            --sampling-mode "{params.sampling_mode}" \
+            {params.unique_flag}
+        """
+
+
+rule run_group_all_samples:
+    input:
+        pop_file=lambda wildcards: get_pop_file(wildcards.panel, wildcards.group)
+    output:
+        summary=f"{OUTPUT_DIR}/{{panel}}/all_samples/{{group}}/summary.tsv",
+        metrics=f"{OUTPUT_DIR}/{{panel}}/all_samples/{{group}}/replicate_metrics.tsv",
+        manifest=f"{OUTPUT_DIR}/{{panel}}/all_samples/{{group}}/replicate_pop_manifest.tsv"
+    params:
+        vcf=VCF_PATH,
+        output_dir=lambda wildcards: f"{OUTPUT_DIR}/{wildcards.panel}/all_samples/{wildcards.group}",
+        sample_n=lambda wildcards: get_n_samples(wildcards.panel, wildcards.group),
+        base_seed=lambda wildcards: PANELS[wildcards.panel]["seed"]
+        + stable_seed(wildcards.panel, wildcards.group, 1),
+        sampling_mode=SAMPLING_MODE,
+        window_size=WINDOW_SIZE,
+        window_step=WINDOW_STEP
+    shell:
+        r"""
+        python3 scripts/run_rarefaction_vcftools.py \
+            --vcf "{params.vcf}" \
+            --source-pop "{input.pop_file}" \
+            --panel "{wildcards.panel}" \
+            --group "{wildcards.group}" \
+            --sample-n "{params.sample_n}" \
+            --replicates "1" \
+            --seed "{params.base_seed}" \
+            --window-size "{params.window_size}" \
+            --window-step "{params.window_step}" \
+            --output-dir "{params.output_dir}" \
+            --summary-out "{output.summary}" \
+            --metrics-out "{output.metrics}" \
+            --manifest-out "{output.manifest}" \
+            --sampling-mode "{params.sampling_mode}" \
+            --unique-only
+        """
+
+
+rule rollup_panel_summary:
+    input:
+        lambda wildcards: panel_summary_inputs(
+            wildcards.panel, int(wildcards.reps)
+        )
+    output:
+        f"{OUTPUT_DIR}/{{panel}}/n{{sample_n}}/rep{{reps}}/panel_summary.tsv"
+    run:
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        header_written = False
+        with open(output[0], "w") as out_handle:
+            for summary_file in input:
+                with open(summary_file) as in_handle:
+                    lines = in_handle.readlines()
+                if not lines:
+                    continue
+                if not header_written:
+                    out_handle.write(lines[0])
+                    header_written = True
+                for line in lines[1:]:
+                    out_handle.write(line)
+
+
+rule rollup_panel_all_samples_summary:
+    input:
+        lambda wildcards: panel_all_samples_summary_inputs(wildcards.panel)
+    output:
+        f"{OUTPUT_DIR}/{{panel}}/all_samples/panel_all_samples_summary.tsv"
+    run:
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        header_written = False
+        with open(output[0], "w") as out_handle:
+            for summary_file in input:
+                with open(summary_file) as in_handle:
+                    lines = in_handle.readlines()
+                if not lines:
+                    continue
+                if not header_written:
+                    out_handle.write(lines[0])
+                    header_written = True
+                for line in lines[1:]:
+                    out_handle.write(line)
+
+
+rule rollup_master_summary:
+    input:
+        master_rollup_targets()
+    output:
+        f"{OUTPUT_DIR}/feasibility/master_panel_summary.tsv"
+    run:
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        header_written = False
+        with open(output[0], "w") as out_handle:
+            for summary_file in input:
+                with open(summary_file) as in_handle:
+                    lines = in_handle.readlines()
+                if not lines:
+                    continue
+                if not header_written:
+                    out_handle.write(lines[0])
+                    header_written = True
+                for line in lines[1:]:
+                    out_handle.write(line)
+
+
+rule rollup_master_all_samples_summary:
+    input:
+        panel_all_samples_summary_targets()
+    output:
+        master_all_samples_summary_path()
+    run:
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        header_written = False
+        with open(output[0], "w") as out_handle:
+            for summary_file in input:
+                with open(summary_file) as in_handle:
+                    lines = in_handle.readlines()
+                if not lines:
+                    continue
+                if not header_written:
+                    out_handle.write(lines[0])
+                    header_written = True
+                for line in lines[1:]:
+                    out_handle.write(line)
+
+
+rule plot_panel_rep_scatter:
+    input:
+        metrics=lambda wildcards: panel_rep_metrics_inputs(
+            wildcards.panel, int(wildcards.reps)
+        ),
+        script="scripts/plot_panel_rarefaction.R"
+    output:
+        f"{OUTPUT_DIR}/plots/{{panel}}/n{{sample_n}}/rep{{reps}}/"
+        f"{{panel}}_n{{sample_n}}_rep{{reps}}_replicate_scatter.pdf"
+    run:
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        input_list = str(output[0]) + ".inputs.txt"
+        with open(input_list, "w") as handle:
+            for path in input.metrics:
+                handle.write(str(path) + "\n")
+        try:
+            subprocess.run(
+                [
+                    "Rscript",
+                    input.script,
+                    "--mode",
+                    "scatter",
+                    "--metrics-list",
+                    input_list,
+                    "--output",
+                    output[0],
+                    "--panel",
+                    wildcards.panel,
+                    "--sample-n",
+                    wildcards.sample_n,
+                    "--replicates",
+                    wildcards.reps,
+                ],
+                check=True,
+            )
+        finally:
+            if os.path.exists(input_list):
+                os.remove(input_list)
+
+
+rule plot_panel_summary:
+    input:
+        summaries=lambda wildcards: panel_rollup_targets(wildcards.panel),
+        script="scripts/plot_panel_rarefaction.R"
+    output:
+        f"{OUTPUT_DIR}/plots/{{panel}}/{{panel}}_summary_by_replicate_count.pdf"
+    run:
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        input_list = str(output[0]) + ".inputs.txt"
+        with open(input_list, "w") as handle:
+            for path in input.summaries:
+                handle.write(str(path) + "\n")
+        try:
+            subprocess.run(
+                [
+                    "Rscript",
+                    input.script,
+                    "--mode",
+                    "summary",
+                    "--summary-list",
+                    input_list,
+                    "--output",
+                    output[0],
+                    "--panel",
+                    wildcards.panel,
+                ],
+                check=True,
+            )
+        finally:
+            if os.path.exists(input_list):
+                os.remove(input_list)
+
+
+rule plot_all_panels_summary:
+    input:
+        summary=f"{OUTPUT_DIR}/feasibility/master_panel_summary.tsv",
+        script="scripts/plot_panel_rarefaction.R"
+    output:
+        all_panels_summary_plot_path()
+    run:
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        input_list = str(output[0]) + ".inputs.txt"
+        with open(input_list, "w") as handle:
+            handle.write(str(input.summary) + "\n")
+        try:
+            subprocess.run(
+                [
+                    "Rscript",
+                    input.script,
+                    "--mode",
+                    "all-summary",
+                    "--summary-list",
+                    input_list,
+                    "--output",
+                    output[0],
+                ],
+                check=True,
+            )
+        finally:
+            if os.path.exists(input_list):
+                os.remove(input_list)
+
+
+rule plot_all_samples_summary:
+    input:
+        summary=master_all_samples_summary_path(),
+        script="scripts/plot_panel_rarefaction.R"
+    output:
+        all_samples_summary_plot_path()
+    run:
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        input_list = str(output[0]) + ".inputs.txt"
+        with open(input_list, "w") as handle:
+            handle.write(str(input.summary) + "\n")
+        try:
+            subprocess.run(
+                [
+                    "Rscript",
+                    input.script,
+                    "--mode",
+                    "all-samples-summary",
+                    "--summary-list",
+                    input_list,
+                    "--output",
+                    output[0],
+                ],
+                check=True,
+            )
+        finally:
+            if os.path.exists(input_list):
+                os.remove(input_list)
+
+
+rule plot_combined_summary:
+    input:
+        rarefaction=f"{OUTPUT_DIR}/feasibility/master_panel_summary.tsv",
+        all_samples=master_all_samples_summary_path(),
+        script="scripts/plot_panel_rarefaction.R"
+    output:
+        combined_summary_plot_path()
+    run:
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        rarefaction_list = str(output[0]) + ".rarefaction.inputs.txt"
+        all_samples_list = str(output[0]) + ".all_samples.inputs.txt"
+        with open(rarefaction_list, "w") as handle:
+            handle.write(str(input.rarefaction) + "\n")
+        with open(all_samples_list, "w") as handle:
+            handle.write(str(input.all_samples) + "\n")
+        try:
+            subprocess.run(
+                [
+                    "Rscript",
+                    input.script,
+                    "--mode",
+                    "combined-summary",
+                    "--summary-list",
+                    rarefaction_list,
+                    "--all-samples-list",
+                    all_samples_list,
+                    "--output",
+                    output[0],
+                ],
+                check=True,
+            )
+        finally:
+            for path in [rarefaction_list, all_samples_list]:
+                if os.path.exists(path):
+                    os.remove(path)

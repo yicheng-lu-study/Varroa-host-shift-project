@@ -1,0 +1,358 @@
+from pathlib import Path
+import glob
+import os
+
+
+localrules: all
+
+
+REFERENCE = "/home/lyh/lyc/project_vcf_M4_nextgenmap_fix/reference/GCF_002443255.1_Vdes_3.0_genomic.fna"
+BAM_DIR = "/data/lyc_vcf_next/output/alignments/ngm"
+OUTPUT_DIR = "/data/lyc_vcf_next/output_705_pi"
+PIXY_PYTHON = "/data/lyc_vcf_next/output_705_pi/pixy_only/bin/python"
+POPULATION_FILES = {
+    "panelA": "/home/lyh/lyc/project_pixy/populations-panelA.txt",
+    "panelB": "/home/lyh/lyc/project_pixy/populations-panelB.txt",
+    "panelC": "/home/lyh/lyc/project_pixy/populations-panelC.txt",
+}
+
+
+MISSING_FILTER_BRANCHES = {
+    "mm95": 0.95,
+    "mm80": 0.8,
+}
+
+BASIC_FILTERS = {
+    "minDP": 5,
+    "maxDP": 50,
+}
+
+VARIANT_FILTERS = {
+    "minQ": 40,
+    "maf": 0.05,
+    "mac": 2,
+    "max_alleles": 2,
+    "remove_indels": True,
+}
+
+# Restrict to the seven nuclear chromosomes used in the current project.
+CHROMS = [
+    "NW_019211454.1",
+    "NW_019211455.1",
+    "NW_019211456.1",
+    "NW_019211457.1",
+    "NW_019211458.1",
+    "NW_019211459.1",
+    "NW_019211460.1",
+]
+
+SAMPLE_LIST = [
+    "SRR11497771", "SRR11497770", "SRR11497748", "SRR11497737", "DRR293519",
+    "DRR293533", "DRR293534", "DRR293528", "DRR293529", "DRR209120",
+    "DRR209117", "DRR209118", "DRR209119", "DRR293421", "DRR209122",
+    "SRR11497736", "SRR11497735", "SRR11497738", "SRR11497740", "SRR11497742",
+    "SRR11497741", "SRR11497746", "SRR11497744", "SRR11497749", "SRR11497745",
+    "SRR11497743", "SRR11497747", "SRR11497750", "SRR11497756", "SRR11497752",
+    "SRR11497754", "SRR11497755", "SRR11497753", "SRR11497751", "SRR11497767",
+    "SRR11497768", "SRR11497760", "SRR11497694", "SRR11497762", "SRR11497704",
+    "SRR11497765", "SRR11497757", "SRR11497761", "SRR11497693", "SRR11497764",
+    "SRR11497766", "DRR209116", "DRR209125", "DRR293532", "DRR293527",
+    "DRR293526", "DRR293525", "DRR212369", "DRR212378", "DRR212379",
+    "DRR212380", "DRR293432", "DRR293434", "DRR212370", "DRR212371",
+    "DRR212372", "DRR293546", "DRR293536", "DRR293537", "DRR293538",
+    "DRR293539", "DRR293540", "DRR293541", "DRR293542", "DRR212373",
+    "DRR293543", "DRR293545", "DRR212374", "DRR212376", "DRR212377",
+    "DRR293447", "DRR293436", "DRR293438", "DRR293441", "DRR293443",
+    "DRR293446", "DRR293448", "DRR293480", "DRR293489", "DRR293610",
+    "DRR293611", "DRR293549", "DRR209115", "DRR293380", "DRR209114",
+    "DRR293141", "DRR293132", "DRR293125", "DRR293144", "DRR293129",
+    "DRR293167", "DRR209111", "DRR209113", "DRR209112", "SRR11497731",
+    "SRR11497724", "SRR11497725", "SRR11497733", "SRR11497734", "SRR11497732",
+    "SRR11497730", "SRR11497728", "SRR11497729", "DRR209109", "DRR209110",
+    "SRR11497705", "SRR11497700", "SRR11497707", "SRR11497702", "SRR11497708",
+    "SRR11497703", "SRR11497706", "SRR11497701", "SRR11497699", "SRR11497698",
+    "SRR11497696", "SRR11497697", "SRR11497695", "SRR11497716", "SRR11497718",
+    "SRR11497717", "SRR11497712", "SRR11497710", "SRR11497713", "SRR11497714",
+    "SRR11497711", "SRR11497709",
+]
+
+BAMS = [f"{BAM_DIR}/{sample}.bam" for sample in SAMPLE_LIST]
+SAMPLES = SAMPLE_LIST[:]
+
+if not BAMS:
+    raise ValueError(f"No BAM files found in {BAM_DIR}")
+
+missing_bams = [bam for bam in BAMS if not os.path.exists(bam)]
+if missing_bams:
+    raise ValueError("Missing BAM files:\n" + "\n".join(missing_bams))
+
+missing_population_files = [
+    path for path in POPULATION_FILES.values() if not os.path.exists(path)
+]
+if missing_population_files:
+    raise ValueError(
+        "Missing population files:\n" + "\n".join(missing_population_files)
+    )
+
+if not os.path.exists(PIXY_PYTHON):
+    raise ValueError(f"Missing pixy python executable: {PIXY_PYTHON}")
+
+
+rule all:
+    input:
+        f"{OUTPUT_DIR}/metadata/bamlist.txt",
+        expand(
+            f"{OUTPUT_DIR}/vcf/{{missing_tag}}/pixy.filtered.allsites.vcf.gz",
+            missing_tag=MISSING_FILTER_BRANCHES.keys(),
+        ),
+        expand(
+            f"{OUTPUT_DIR}/vcf/{{missing_tag}}/pixy.filtered.allsites.vcf.gz.tbi",
+            missing_tag=MISSING_FILTER_BRANCHES.keys(),
+        ),
+        expand(
+            f"{OUTPUT_DIR}/pixy/{{missing_tag}}/{{panel}}/pixy_pi.txt",
+            missing_tag=MISSING_FILTER_BRANCHES.keys(),
+            panel=POPULATION_FILES.keys(),
+        ),
+
+
+rule make_bamlist:
+    input:
+        BAMS
+    output:
+        f"{OUTPUT_DIR}/metadata/bamlist.txt"
+    run:
+        Path(os.path.dirname(output[0])).mkdir(parents=True, exist_ok=True)
+        with open(output[0], "w") as handle:
+            for bam in input:
+                handle.write(f"{bam}\n")
+
+
+rule call_allsites_per_chrom:
+    input:
+        bamlist=f"{OUTPUT_DIR}/metadata/bamlist.txt"
+    output:
+        vcf=f"{OUTPUT_DIR}/vcf/raw/{{chrom}}.allsites.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/raw/{{chrom}}.allsites.vcf.gz.tbi"
+    params:
+        region=lambda wildcards: wildcards.chrom
+    threads: 8
+    shell:
+        r"""
+        mkdir -p {OUTPUT_DIR}/vcf/raw
+        bcftools mpileup \
+            -Ou \
+            -f {REFERENCE} \
+            -b {input.bamlist} \
+            -r {params.region} \
+            --max-depth 1000 \
+        | bcftools call \
+            --threads {threads} \
+            -m \
+            -Oz \
+            -f GQ \
+            -o {output.vcf}
+        tabix -f -p vcf {output.vcf}
+        """
+
+
+rule basic_filter_per_chrom:
+    input:
+        vcf=f"{OUTPUT_DIR}/vcf/raw/{{chrom}}.allsites.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/raw/{{chrom}}.allsites.vcf.gz.tbi"
+    output:
+        vcf=f"{OUTPUT_DIR}/vcf/basic/{{missing_tag}}/{{chrom}}.basic.allsites.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/basic/{{missing_tag}}/{{chrom}}.basic.allsites.vcf.gz.tbi"
+    params:
+        max_missing=lambda wildcards: MISSING_FILTER_BRANCHES[wildcards.missing_tag],
+        minDP=BASIC_FILTERS["minDP"],
+        maxDP=BASIC_FILTERS["maxDP"]
+    shell:
+        r"""
+        mkdir -p {OUTPUT_DIR}/vcf/basic/{wildcards.missing_tag}
+        vcftools \
+            --gzvcf {input.vcf} \
+            --max-missing {params.max_missing} \
+            --minDP {params.minDP} \
+            --maxDP {params.maxDP} \
+            --recode \
+            --recode-INFO-all \
+            --stdout \
+        | bgzip -c > {output.vcf}
+        tabix -f -p vcf {output.vcf}
+        """
+
+
+rule split_invariant_per_chrom:
+    input:
+        vcf=f"{OUTPUT_DIR}/vcf/basic/{{missing_tag}}/{{chrom}}.basic.allsites.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/basic/{{missing_tag}}/{{chrom}}.basic.allsites.vcf.gz.tbi"
+    output:
+        vcf=f"{OUTPUT_DIR}/vcf/split/{{missing_tag}}/{{chrom}}.invariant.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/split/{{missing_tag}}/{{chrom}}.invariant.vcf.gz.tbi"
+    threads: 8
+    shell:
+        r"""
+        mkdir -p {OUTPUT_DIR}/vcf/split/{wildcards.missing_tag}
+        bcftools view \
+            --threads {threads} \
+            -i 'N_ALT=0' \
+            -Oz \
+            -o {output.vcf} \
+            {input.vcf}
+        tabix -f -p vcf {output.vcf}
+        """
+
+
+rule split_variant_per_chrom:
+    input:
+        vcf=f"{OUTPUT_DIR}/vcf/basic/{{missing_tag}}/{{chrom}}.basic.allsites.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/basic/{{missing_tag}}/{{chrom}}.basic.allsites.vcf.gz.tbi"
+    output:
+        vcf=f"{OUTPUT_DIR}/vcf/split/{{missing_tag}}/{{chrom}}.variant.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/split/{{missing_tag}}/{{chrom}}.variant.vcf.gz.tbi"
+    threads: 8
+    shell:
+        r"""
+        mkdir -p {OUTPUT_DIR}/vcf/split/{wildcards.missing_tag}
+        bcftools view \
+            --threads {threads} \
+            -i 'N_ALT>0' \
+            -Oz \
+            -o {output.vcf} \
+            {input.vcf}
+        tabix -f -p vcf {output.vcf}
+        """
+
+
+rule filter_invariant_per_chrom:
+    input:
+        vcf=f"{OUTPUT_DIR}/vcf/split/{{missing_tag}}/{{chrom}}.invariant.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/split/{{missing_tag}}/{{chrom}}.invariant.vcf.gz.tbi"
+    output:
+        vcf=f"{OUTPUT_DIR}/vcf/filtered/{{missing_tag}}/{{chrom}}.invariant.filtered.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/filtered/{{missing_tag}}/{{chrom}}.invariant.filtered.vcf.gz.tbi"
+    threads: 8
+    shell:
+        r"""
+        mkdir -p {OUTPUT_DIR}/vcf/filtered/{wildcards.missing_tag}
+        # Keep this branch free of population-genetic MAC/MAF filters.
+        bcftools view \
+            --threads {threads} \
+            -Oz \
+            -o {output.vcf} \
+            {input.vcf}
+        tabix -f -p vcf {output.vcf}
+        """
+
+
+rule filter_variant_per_chrom:
+    input:
+        vcf=f"{OUTPUT_DIR}/vcf/split/{{missing_tag}}/{{chrom}}.variant.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/split/{{missing_tag}}/{{chrom}}.variant.vcf.gz.tbi"
+    output:
+        vcf=f"{OUTPUT_DIR}/vcf/filtered/{{missing_tag}}/{{chrom}}.variant.filtered.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/filtered/{{missing_tag}}/{{chrom}}.variant.filtered.vcf.gz.tbi"
+    params:
+        minQ=VARIANT_FILTERS["minQ"],
+        maf=VARIANT_FILTERS["maf"],
+        mac=VARIANT_FILTERS["mac"],
+        max_alleles=VARIANT_FILTERS["max_alleles"],
+        remove_indels=VARIANT_FILTERS["remove_indels"]
+    shell:
+        r"""
+        mkdir -p {OUTPUT_DIR}/vcf/filtered/{wildcards.missing_tag}
+        vcftools \
+            --gzvcf {input.vcf} \
+            --minQ {params.minQ} \
+            --maf {params.maf} \
+            --mac {params.mac} \
+            --max-alleles {params.max_alleles} \
+            --remove-indels \
+            --recode \
+            --recode-INFO-all \
+            --stdout \
+        | bgzip -c > {output.vcf}
+        tabix -f -p vcf {output.vcf}
+        """
+
+
+rule concat_branches_per_chrom:
+    input:
+        invariant_vcf=f"{OUTPUT_DIR}/vcf/filtered/{{missing_tag}}/{{chrom}}.invariant.filtered.vcf.gz",
+        invariant_tbi=f"{OUTPUT_DIR}/vcf/filtered/{{missing_tag}}/{{chrom}}.invariant.filtered.vcf.gz.tbi",
+        variant_vcf=f"{OUTPUT_DIR}/vcf/filtered/{{missing_tag}}/{{chrom}}.variant.filtered.vcf.gz",
+        variant_tbi=f"{OUTPUT_DIR}/vcf/filtered/{{missing_tag}}/{{chrom}}.variant.filtered.vcf.gz.tbi"
+    output:
+        vcf=f"{OUTPUT_DIR}/vcf/rebuilt/{{missing_tag}}/{{chrom}}.pixy-ready.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/rebuilt/{{missing_tag}}/{{chrom}}.pixy-ready.vcf.gz.tbi"
+    threads: 8
+    shell:
+        r"""
+        mkdir -p {OUTPUT_DIR}/vcf/rebuilt/{wildcards.missing_tag}
+        bcftools concat \
+            --threads {threads} \
+            -a \
+            -Oz \
+            -o {output.vcf}.tmp.concat.vcf.gz \
+            {input.invariant_vcf} \
+            {input.variant_vcf}
+        bcftools sort \
+            --threads {threads} \
+            -Oz \
+            -o {output.vcf} \
+            {output.vcf}.tmp.concat.vcf.gz
+        tabix -f -p vcf {output.vcf}
+        rm -f {output.vcf}.tmp.concat.vcf.gz
+        """
+
+
+rule merge_pixy_ready_vcf:
+    input:
+        vcfs=lambda wildcards: expand(
+            f"{OUTPUT_DIR}/vcf/rebuilt/{wildcards.missing_tag}" + "/{chrom}.pixy-ready.vcf.gz",
+            chrom=CHROMS,
+        ),
+        tbis=lambda wildcards: expand(
+            f"{OUTPUT_DIR}/vcf/rebuilt/{wildcards.missing_tag}" + "/{chrom}.pixy-ready.vcf.gz.tbi",
+            chrom=CHROMS,
+        )
+    output:
+        vcf=f"{OUTPUT_DIR}/vcf/{{missing_tag}}/pixy.filtered.allsites.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/{{missing_tag}}/pixy.filtered.allsites.vcf.gz.tbi"
+    threads: 8
+    shell:
+        r"""
+        mkdir -p {OUTPUT_DIR}/vcf/{wildcards.missing_tag}
+        bcftools concat \
+            --threads {threads} \
+            -Oz \
+            -o {output.vcf} \
+            {input.vcfs}
+        tabix -f -p vcf {output.vcf}
+        """
+
+
+rule run_pixy:
+    input:
+        vcf=f"{OUTPUT_DIR}/vcf/{{missing_tag}}/pixy.filtered.allsites.vcf.gz",
+        tbi=f"{OUTPUT_DIR}/vcf/{{missing_tag}}/pixy.filtered.allsites.vcf.gz.tbi",
+        populations=lambda wildcards: POPULATION_FILES[wildcards.panel]
+    output:
+        f"{OUTPUT_DIR}/pixy/{{missing_tag}}/{{panel}}/pixy_pi.txt"
+    params:
+        window_size=100000,
+        output_prefix="pixy"
+    threads: 8
+    shell:
+        r"""
+        mkdir -p {OUTPUT_DIR}/pixy/{wildcards.missing_tag}/{wildcards.panel}
+        {PIXY_PYTHON} -m pixy \
+            --stats pi \
+            --vcf {input.vcf} \
+            --populations {input.populations} \
+            --window_size {params.window_size} \
+            --n_cores {threads} \
+            --output_folder {OUTPUT_DIR}/pixy/{wildcards.missing_tag}/{wildcards.panel} \
+            --output_prefix {params.output_prefix}
+        """
