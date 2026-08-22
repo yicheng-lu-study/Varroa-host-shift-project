@@ -1,0 +1,1 @@
+iqtree2 -s /home/lyh/lyc/project_vcf_iqtree_10/input/1214double/1213check_mafft_trimal_204.phy -m MFP -B 1000 --alrt 1000 -bnni -T 40
