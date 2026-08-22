@@ -14,11 +14,6 @@ The `Snakefile` in this repository is adapted from the original version develope
 *   **Original Project Description**: This repository contains the analysis pipeline for studying varroa mite pedigree data.
 
 ### Modifications
-This version includes modifications to the original `Snakefile`. For a detailed description of the specific changes, please refer to the **Methods** section of the manuscript associated with this work.
+This version includes modifications to the original `Snakefile`. The parameter settings used in this study are reported in the **Methods** section of the associated manuscript and should be considered authoritative. In case of any discrepancy, please refer to the manuscript.
 
-### Usage Notes
-The usage of this modified workflow may differ from the original. Please consult the documentation in this repository for setup and execution instructions.
-
-**Note**: This work builds upon the open-source contributions of the original authors. All original license terms apply to this modified version.
-
-If you have any questions, please feel free to contact yichenglu@zju.edu.cn.
+If you have any questions, please feel free to contact yichenglu@zju.edu.cn. Due to file size limitations, some large files are stored separately at the link provided in the manuscript. Please refer to the DATA ACCESSIBILITY STATEMENT of the manuscript for details.
